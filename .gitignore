@@ -1,0 +1,13 @@
+# Ignore Python cache
+__pycache__/
+
+# Ignore datasets
+data/
+*.wav
+*.mp3
+
+# Ignore virtual env
+.venv/
+
+# Ignore models (optional)
+*.pkl
