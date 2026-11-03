@@ -1,117 +1,84 @@
-import streamlit as st
-import joblib
+"""VeraVoice demo: is this voice a real person or a synthetic clone?"""
+
+import io
+import json
 import os
-import tempfile
+
 import numpy as np
-import queue
 import soundfile as sf
+import streamlit as st
 
-from features import extract_mfcc_features
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, AudioProcessorBase
+from veravoice.audio import load_audio
 
-# ---------------------------------------------------
-# Streamlit UI setup
-# ---------------------------------------------------
-st.set_page_config(page_title="VeraVoice Demo", layout="centered")
-st.title("VeraVoice — Voice Deepfake Detector (Hackathon MVP)")
+MODEL_DIR = os.environ.get("VERAVOICE_MODEL", "model")
 
-# Load trained SVM model
-MODEL_PATH = os.path.join("models", "svm_mfcc.pkl")
-clf = joblib.load(MODEL_PATH)
+st.set_page_config(page_title="VeraVoice", page_icon="🎙️", layout="centered")
+st.title("VeraVoice")
+st.caption("Proof of human for voice: scores a clip for signs of text-to-speech or voice cloning.")
 
-# ---------------------------------------------------
-# Modes: Upload vs Live Mic
-# ---------------------------------------------------
-mode = st.radio("Choose input mode:", ["📂 Upload File", "🎙️ Live Mic"])
 
-# ---------------------------------------------------
-# Upload file mode
-# ---------------------------------------------------
-if mode == "📂 Upload File":
-    uploaded_file = st.file_uploader("Upload an audio file", type=["wav", "mp3", "m4a"])
-    if uploaded_file:
-        # Save temp file
-        tmp_path = tempfile.mktemp(suffix=".wav")
-        with open(tmp_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
+@st.cache_resource(show_spinner="Loading WavLM (first run downloads about 380 MB)...")
+def get_detector():
+    from veravoice.detector import Detector
 
-        try:
-            feat = extract_mfcc_features(tmp_path, sr=16000)
-            probs = clf.predict_proba(feat.reshape(1, -1))[0]
-            classes = list(getattr(clf, "classes_", range(len(probs))))
+    return Detector(MODEL_DIR)
 
-            # Find fake index
-            fake_idx = None
-            for i, c in enumerate(classes):
-                if str(c).lower() in ("1", "fake", "true"):
-                    fake_idx = i
-                    break
-            if fake_idx is None:
-                fake_idx = 1 if len(classes) > 1 else 0
 
-            fake_prob = probs[fake_idx]
-
-            st.audio(uploaded_file)
-            st.metric("Fake probability", f"{fake_prob*100:.1f}%")
-
-        except Exception as e:
-            st.error(f"Error processing file: {e}")
-        finally:
-            os.remove(tmp_path)
-# ---------------------------------------------------
-# Live mic mode
-# ---------------------------------------------------
-elif mode == "🎙️ Live Mic":
-    class AudioProcessor(AudioProcessorBase):
-        def __init__(self):
-            self.recorded_frames = []
-
-        def recv_audio_frame(self, frame):
-            audio = frame.to_ndarray().flatten().astype(np.float32)
-            self.recorded_frames.append(audio)
-            return frame
-
-    ctx = webrtc_streamer(
-        key="example",
-        mode=WebRtcMode.SENDRECV,
-        audio_receiver_size=256,
-        media_stream_constraints={"audio": True, "video": False},
-        audio_processor_factory=AudioProcessor,
+if not os.path.exists(os.path.join(MODEL_DIR, "config.json")):
+    st.error(
+        f"No trained model found in `{MODEL_DIR}/`. Train one with `notebooks/kaggle_train.ipynb` "
+        "(see the README), or set VERAVOICE_MODEL to a bundle folder."
     )
+    st.stop()
 
-    if ctx.audio_processor:
-        if st.button("Stop & Analyze Recording"):
-            if len(ctx.audio_processor.recorded_frames) == 0:
-                st.warning("⚠️ No audio captured. Please speak into your mic before stopping.")
-            else:
-                # Concatenate recorded chunks
-                audio_data = np.concatenate(ctx.audio_processor.recorded_frames, axis=0)
+detector = get_detector()
+metrics = detector.config.get("metrics", {})
 
-                # Save to temporary WAV file so it matches upload pipeline
-                tmp_path = tempfile.mktemp(suffix=".wav")
-                sf.write(tmp_path, audio_data, 16000)  # 16kHz same as training
+upload_tab, mic_tab = st.tabs(["Upload a clip", "Record with your mic"])
+audio_bytes = None
+with upload_tab:
+    f = st.file_uploader("WAV, FLAC, MP3, M4A or OGG", type=["wav", "flac", "mp3", "m4a", "ogg"])
+    if f:
+        audio_bytes = f.getvalue()
+with mic_tab:
+    rec = st.audio_input("Speak for 3 to 10 seconds")
+    if rec:
+        audio_bytes = rec.getvalue()
 
-                try:
-                    feat = extract_mfcc_features(tmp_path, sr=16000)
-                    probs = clf.predict_proba(feat.reshape(1, -1))[0]
-                    classes = list(getattr(clf, "classes_", range(len(probs))))
+if audio_bytes:
+    st.audio(audio_bytes)
+    with st.spinner("Analyzing..."):
+        try:
+            y, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
+        except Exception:
+            # Formats libsndfile can't read (m4a, some mp3) go through librosa/audioread.
+            import tempfile
 
-                    # Find fake index
-                    fake_idx = None
-                    for i, c in enumerate(classes):
-                        if str(c).lower() in ("1", "fake", "true"):
-                            fake_idx = i
-                            break
-                    if fake_idx is None:
-                        fake_idx = 1 if len(classes) > 1 else 0
+            with tempfile.NamedTemporaryFile(suffix=".audio") as tmp:
+                tmp.write(audio_bytes)
+                tmp.flush()
+                y, sr = load_audio(tmp.name), 16_000
+        if len(y) < sr // 2:
+            st.warning("That clip is under half a second. Record or upload at least 2 seconds of speech.")
+            st.stop()
+        result = detector.predict_waveform(np.asarray(y), sr)
 
-                    fake_prob = probs[fake_idx]
+    icon = {"likely human": "✅", "likely synthetic": "🚩", "uncertain": "🤔"}[result.verdict]
+    st.subheader(f"{icon} {result.verdict.capitalize()}")
+    st.metric("Synthetic-speech score", f"{result.spoof_probability * 100:.0f}%")
+    if len(result.chunk_probabilities) > 1:
+        st.caption("Score per 4-second window")
+        st.bar_chart(result.chunk_probabilities)
 
-                    st.audio(tmp_path)
-                    st.metric("Fake probability (live)", f"{fake_prob*100:.1f}%")
-
-                except Exception as e:
-                    st.error(f"Error analyzing mic input: {e}")
-                finally:
-                    os.remove(tmp_path)
-
+with st.expander("How it works and how well it does"):
+    st.markdown(
+        "Audio is resampled to 16 kHz, trimmed and normalized, then passed through a frozen "
+        "[WavLM](https://huggingface.co/microsoft/wavlm-base-plus) model. A small classifier learns "
+        "which WavLM layers carry the artefacts that vocoders leave behind."
+    )
+    if metrics:
+        st.json(json.loads(json.dumps(metrics)))
+    st.markdown(
+        "Treat the score as a signal, not proof. Heavy compression, phone audio and background "
+        "music all make the job harder."
+    )
