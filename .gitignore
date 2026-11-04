@@ -1,13 +1,16 @@
-# Ignore Python cache
 __pycache__/
+.venv/
+.pytest_cache/
+.ruff_cache/
 
-# Ignore datasets
+# Datasets and extracted features stay out of git
 data/
+feats/
+manifests/
 *.wav
 *.mp3
+*.flac
+*.npz
 
-# Ignore virtual env
-.venv/
-
-# Ignore models (optional)
+# Only the trained head in model/ is committed; old pickles are not
 *.pkl

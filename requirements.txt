@@ -1,6 +1,6 @@
-streamlit
-librosa
-soundfile
-numpy
-scikit-learn
-joblib
+numpy>=1.26
+librosa>=0.10
+soundfile>=0.12
+torch>=2.2
+transformers>=4.40
+streamlit>=1.39
